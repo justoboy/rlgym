@@ -1,29 +1,41 @@
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import RocketSim as rsim
 import numpy as np
 from rlgym.api import TransitionEngine, AgentID
 from rlgym.rocket_league.api import Car, GameConfig, GameState, PhysicsObject
-from rlgym.rocket_league.common_values import BOOST_CONSUMPTION_RATE, GRAVITY, GOAL_THRESHOLD
+from rlgym.rocket_league.common_values import (
+    BOOST_CONSUMPTION_RATE, GRAVITY,
+    DEFAULT_CAR_MASS, DEFAULT_CAR_WORLD_FRICTION, DEFAULT_CAR_WORLD_RESTITUTION,
+    DEFAULT_JUMP_ACCEL, DEFAULT_JUMP_IMMEDIATE_FORCE,
+    DEFAULT_BOOST_ACCEL_GROUND, DEFAULT_BOOST_ACCEL_AIR,
+    DEFAULT_RESPAWN_DELAY, DEFAULT_BUMP_COOLDOWN_TIME,
+    DEFAULT_BOOST_PAD_COOLDOWN_BIG, DEFAULT_BOOST_PAD_COOLDOWN_SMALL,
+    DEFAULT_BALL_RADIUS, DEFAULT_BALL_MASS, DEFAULT_BALL_MAX_SPEED, DEFAULT_BALL_DRAG,
+    DEFAULT_BALL_WORLD_FRICTION, DEFAULT_BALL_WORLD_RESTITUTION,
+    DEFAULT_BALL_HIT_EXTRA_FORCE_SCALE, DEFAULT_BUMP_FORCE_SCALE,
+    DEFAULT_UNLIMITED_FLIPS, DEFAULT_UNLIMITED_DOUBLE_JUMPS,
+    DEFAULT_DEMO_MODE, DEFAULT_ENABLE_TEAM_DEMOS,
+)
 
 
 class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
     """
     A headless Rocket League TransitionEngine backed by RocketSim.
 
-    Simulates a normal soccar game with a single ball and any number of cars.
+    Mode-aware: one rsim.Arena is built per GameMode and cached; the active mode is
+    selected via set_mode(). Native goal callbacks and native (random, mirrored)
+    kickoff resets are used for every mode, so no Python kickoff fabrication is needed.
     """
 
     def __init__(self, rlbot_delay=True, game_mode: rsim.GameMode = rsim.GameMode.SOCCAR):
         """
         A headless Rocket League TransitionEngine backed by RocketSim.
 
-        Simulates a normal soccar game with a single ball and any number of cars.
-
         :param rlbot_delay: Enables RLBot-like 1 tick delay for actions.
             This forces the first action of the episode to no-op
-        :param game_mode: Allows you to select any other RocketSim supported GameMode
+        :param game_mode: The initial RocketSim GameMode to run
         """
         try:
             cur_dir = os.path.dirname(os.path.realpath(__file__))
@@ -31,6 +43,8 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
         except Exception:
             pass
         self._rlbot_delay = rlbot_delay
+        self._game_mode = game_mode
+        self._arenas: Dict[rsim.GameMode, rsim.Arena] = {}
         self._state = None
         self._tick_count = None
         self._game_config = None
@@ -38,8 +52,39 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
         self._agent_ids: Dict[int, AgentID] = {}
         self._hitboxes: Dict[int, int] = {}
         self._touches: Dict[int, int] = {}
-        self._arena = rsim.Arena(game_mode)
-        self._arena.set_ball_touch_callback(self._ball_touch_callback)
+        # Native goal latch (edge): set by the goal-score callback, consumed by _get_state.
+        self._pending_goal_scored: bool = False
+        self._pending_scoring_team: Optional[int] = None
+        # Sticky guard so a goal is reported exactly once (edge) even though the core
+        #  re-fires the callback every tick the ball remains inside the goal.
+        self._goal_reported: bool = False
+        # Build the initial mode's arena.
+        self._get_or_create_arena(game_mode)
+
+    @property
+    def _arena(self) -> rsim.Arena:
+        return self._arenas[self._game_mode]
+
+    def _get_or_create_arena(self, game_mode: rsim.GameMode) -> rsim.Arena:
+        arena = self._arenas.get(game_mode)
+        if arena is None:
+            arena = rsim.Arena(game_mode)
+            arena.set_ball_touch_callback(self._ball_touch_callback)
+            arena.set_goal_score_callback(self._goal_score_callback)
+            self._arenas[game_mode] = arena
+        return arena
+
+    @property
+    def game_mode(self) -> rsim.GameMode:
+        return self._game_mode
+
+    def set_mode(self, game_mode: rsim.GameMode) -> None:
+        """
+        Switch the active game mode. Builds (and caches) the arena for that mode on
+        first use and routes all subsequent step/set_state/_get_state calls to it.
+        """
+        self._get_or_create_arena(game_mode)
+        self._game_mode = game_mode
 
     @property
     def agents(self) -> List[AgentID]:
@@ -103,10 +148,34 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
     def set_state(self, desired_state: GameState, shared_info: Dict[str, Any]) -> GameState:
         self._tick_count = desired_state.tick_count
 
-        config = rsim.MutatorConfig()
-        config.gravity = rsim.Vec(0, 0, desired_state.config.gravity * -GRAVITY)
-        config.boost_used_per_second = desired_state.config.boost_consumption * BOOST_CONSUMPTION_RATE
-        self._arena.set_mutator_config(config)
+        config = desired_state.config
+        mutators = rsim.MutatorConfig()
+        mutators.gravity = rsim.Vec(0, 0, config.gravity * -GRAVITY)
+        mutators.boost_used_per_second = config.boost_consumption * BOOST_CONSUMPTION_RATE
+        mutators.car_mass = config.car_mass
+        mutators.car_world_friction = config.car_world_friction
+        mutators.car_world_restitution = config.car_world_restitution
+        mutators.jump_accel = config.jump_accel
+        mutators.jump_immediate_force = config.jump_immediate_force
+        mutators.boost_accel_ground = config.boost_accel_ground
+        mutators.boost_accel_air = config.boost_accel_air
+        mutators.respawn_delay = config.respawn_delay
+        mutators.bump_cooldown_time = config.bump_cooldown_time
+        mutators.boost_pad_cooldown_big = config.boost_pad_cooldown_big
+        mutators.boost_pad_cooldown_small = config.boost_pad_cooldown_small
+        mutators.ball_radius = config.ball_radius
+        mutators.ball_mass = config.ball_mass
+        mutators.ball_max_speed = config.ball_max_speed
+        mutators.ball_drag = config.ball_drag
+        mutators.ball_world_friction = config.ball_world_friction
+        mutators.ball_world_restitution = config.ball_world_restitution
+        mutators.ball_hit_extra_force_scale = config.ball_hit_extra_force_scale
+        mutators.bump_force_scale = config.bump_force_scale
+        mutators.unlimited_flips = config.unlimited_flips
+        mutators.unlimited_double_jumps = config.unlimited_double_jumps
+        mutators.demo_mode = config.demo_mode
+        mutators.enable_team_demos = config.enable_team_demos
+        self._arena.set_mutator_config(mutators)
         self._game_config = desired_state.config
 
         ball_state = rsim.BallState()
@@ -117,6 +186,13 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
             ball_state.rot_mat = rsim.RotMat(*desired_state.ball.rotation_mtx.transpose().flatten())
         except ValueError:
             pass
+        # Carry heatseeker info through (defaults are inactive / soccar-irrelevant).
+        if desired_state.ball.heatseeker_target_dir is not None:
+            ball_state.heatseeker_target_dir = desired_state.ball.heatseeker_target_dir
+        if desired_state.ball.heatseeker_target_speed is not None:
+            ball_state.heatseeker_target_speed = desired_state.ball.heatseeker_target_speed
+        if desired_state.ball.heatseeker_time_since_hit is not None:
+            ball_state.heatseeker_time_since_hit = desired_state.ball.heatseeker_time_since_hit
         self._arena.ball.set_state(ball_state)
 
         # TODO reuse cars? We'd have to check the hitbox
@@ -126,11 +202,18 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
         self._agent_ids.clear()
         self._hitboxes.clear()
         self._touches.clear()
+        # Seed the goal latch from the desired state so a restored/replayed goal is reported
+        #  by the subsequent _get_state call (edge semantics preserved).
+        self._pending_goal_scored = bool(desired_state.goal_scored)
+        self._pending_scoring_team = desired_state.scoring_team
+        # If the restored state already has a goal, treat it as already-reported so the core's
+        #  per-tick re-fire doesn't double-report.
+        self._goal_reported = bool(desired_state.goal_scored)
 
         for agent_id, desired_car in desired_state.cars.items():
-            config = rsim.CarConfig(desired_car.hitbox_type)
-            config.dodge_deadzone = desired_state.config.dodge_deadzone
-            car: rsim.Car = self._arena.add_car(desired_car.team_num, config)
+            car_config = rsim.CarConfig(desired_car.hitbox_type)
+            car_config.dodge_deadzone = config.dodge_deadzone
+            car: rsim.Car = self._arena.add_car(desired_car.team_num, car_config)
             self._cars[agent_id] = car
             self._agent_ids[car.id] = agent_id
             self._hitboxes[car.id] = desired_car.hitbox_type
@@ -149,6 +232,20 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
 
         return self._get_state()
 
+    def reset_kickoff(self) -> GameState:
+        """
+        Reset the active arena to a native, random (but mirrored) kickoff for the active
+        game mode. Replaces the old Python KickoffMutator fabrication for every mode.
+        Returns the resulting GameState.
+        """
+        self._arena.reset_kickoff()
+        self._tick_count = 0
+        # A fresh kickoff means no goal is pending and the next goal should be reportable.
+        self._pending_goal_scored = False
+        self._pending_scoring_team = None
+        self._goal_reported = False
+        return self._get_state()
+
     def _get_state(self) -> GameState:
         gs = GameState()
         gs.tick_count = self._tick_count
@@ -160,9 +257,16 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
         gs.ball.linear_velocity = ball_state.vel.as_numpy()
         gs.ball.angular_velocity = ball_state.ang_vel.as_numpy()
         gs.ball.rotation_mtx = np.ascontiguousarray(ball_state.rot_mat.as_numpy().reshape(3, 3).transpose())
+        # Carry heatseeker info (native, mode-aware; inactive for soccar).
+        gs.ball.heatseeker_target_dir = ball_state.heatseeker_target_dir
+        gs.ball.heatseeker_target_speed = ball_state.heatseeker_target_speed
+        gs.ball.heatseeker_time_since_hit = ball_state.heatseeker_time_since_hit
 
-        # Only works for soccar
-        gs.goal_scored = abs(gs.ball.position[1]) > GOAL_THRESHOLD
+        # Native goal latch (edge): consume the pending goal and clear it for the next step.
+        gs.goal_scored = self._pending_goal_scored
+        gs.scoring_team = self._pending_scoring_team
+        self._pending_goal_scored = False
+        self._pending_scoring_team = None
 
         gs.cars = {}
         for agent_id, rsim_car in self._cars.items():
@@ -257,15 +361,49 @@ class RocketSimEngine(TransitionEngine[AgentID, GameState, np.ndarray]):
     def _ball_touch_callback(self, arena: rsim.Arena, car: rsim.Car, data):
         self._touches[car.id] += 1
 
+    def _goal_score_callback(self, arena: rsim.Arena, team: int, data):
+        # The core re-fires this every tick the ball is inside the goal; report exactly once (edge).
+        if self._goal_reported:
+            return
+        self._goal_reported = True
+        self._pending_goal_scored = True
+        self._pending_scoring_team = int(team)
+
     def create_base_state(self) -> GameState:
         gs = GameState()
         gs.tick_count = 0
         gs.goal_scored = False
+        gs.scoring_team = None
 
         gs.config = GameConfig()
         gs.config.gravity = 1
         gs.config.boost_consumption = 1
         gs.config.dodge_deadzone = 0.5
+
+        gs.config.car_mass = DEFAULT_CAR_MASS
+        gs.config.car_world_friction = DEFAULT_CAR_WORLD_FRICTION
+        gs.config.car_world_restitution = DEFAULT_CAR_WORLD_RESTITUTION
+        gs.config.jump_accel = DEFAULT_JUMP_ACCEL
+        gs.config.jump_immediate_force = DEFAULT_JUMP_IMMEDIATE_FORCE
+        gs.config.boost_accel_ground = DEFAULT_BOOST_ACCEL_GROUND
+        gs.config.boost_accel_air = DEFAULT_BOOST_ACCEL_AIR
+        gs.config.respawn_delay = DEFAULT_RESPAWN_DELAY
+        gs.config.bump_cooldown_time = DEFAULT_BUMP_COOLDOWN_TIME
+        gs.config.boost_pad_cooldown_big = DEFAULT_BOOST_PAD_COOLDOWN_BIG
+        gs.config.boost_pad_cooldown_small = DEFAULT_BOOST_PAD_COOLDOWN_SMALL
+        gs.config.unlimited_flips = DEFAULT_UNLIMITED_FLIPS
+        gs.config.unlimited_double_jumps = DEFAULT_UNLIMITED_DOUBLE_JUMPS
+        gs.config.demo_mode = DEFAULT_DEMO_MODE
+        gs.config.enable_team_demos = DEFAULT_ENABLE_TEAM_DEMOS
+
+        gs.config.ball_radius = DEFAULT_BALL_RADIUS
+        gs.config.ball_mass = DEFAULT_BALL_MASS
+        gs.config.ball_max_speed = DEFAULT_BALL_MAX_SPEED
+        gs.config.ball_drag = DEFAULT_BALL_DRAG
+        gs.config.ball_world_friction = DEFAULT_BALL_WORLD_FRICTION
+        gs.config.ball_world_restitution = DEFAULT_BALL_WORLD_RESTITUTION
+        gs.config.ball_hit_extra_force_scale = DEFAULT_BALL_HIT_EXTRA_FORCE_SCALE
+        gs.config.bump_force_scale = DEFAULT_BUMP_FORCE_SCALE
 
         gs.ball = PhysicsObject()
         gs.cars = {}

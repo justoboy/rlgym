@@ -32,17 +32,29 @@ initial backup commit, THEN edit.
 - custombot's old T1 (hoops geometry probe) and T2 (Python goal wrapper) are **retired** — the arena
   scores its own goals. T3's `goal_center/normal/radius` conditioning fields are **dropped**.
 - `mode_setters.py`'s fabricated per-mode spawns are **retired** in favor of `arena.reset_kickoff`.
+- **Kickoff is UNIFIED across ALL modes (user decision, supersedes the old "soccar keeps
+  KickoffMutator byte-identical" line).** `Arena::ResetToRandomKickoff` already has a soccar spawn
+  table (`CAR_SPAWN_LOCATIONS_SOCCAR`) and auto-selects the per-mode table (soccar/heatseeker/
+  hoops/dropshot) from `gameMode`, mirroring blue/orange (`pos *= {-1,-1,1}`, `yaw += pi`). So the
+  engine exposes a `reset_kickoff()` that calls `self._arena.reset_kickoff()` with **no seed**
+  (random each kickoff, still mirrored). The Python `KickoffMutator` tables become redundant for
+  every mode, soccar included. No seed is plumbed into `GameState`.
 
 ## Sub-steps
 
 1. **rlgym fork — mode-aware engine.** Extend `RocketSimEngine` to build one `rsim.Arena(mode)` per
    mode in a dict and route `step`/`set_state`/`_get_state` to the arena for the active mode
    (active mode set via a `set_mode(mode)` the sampler mutator calls before each episode).
-   `reset_kickoff(seed)` replaces Python kickoff fabrication for non-soccar modes; soccar keeps the
-   `KickoffMutator` path byte-identical.
+   `reset_kickoff()` (no seed → random, mirrored) replaces Python kickoff fabrication for ALL modes
+   including soccar; `set_state` stays mode-agnostic (copies incoming `GameState` ball/car positions,
+   which is also what replay-BC state restore needs).
 2. **rlgym fork — native goal plumbing.** In `_get_state`, replace the y-plane hack: register
    `set_goal_score_callback` on every arena; the callback latches a pending goal (scoring team)
    that `_get_state` writes into `gs.goal_scored` (edge, not level) and clears next step.
+   **`GameState.scoring_team` becomes a STORED field (int team id, or None), latched by the native
+   goal-score callback** — it is no longer the soccar y-plane `@property` (`ball.position[1] > 0`),
+   which is wrong for hoops/other arenas. `GoalReward`/`GoalCondition` keep reading `gs.goal_scored`
+   and `gs.scoring_team` unchanged (just now backed by the native latch).
 3. **rlgym fork — carry hsInfo.** Widen `PhysicsObject`/`GameState` with `heatseeker_target_dir`,
    `heatseeker_target_speed`, `heatseeker_time_since_hit`; copy in `_get_state`, restore in
    `set_state`. Defaults = inactive.

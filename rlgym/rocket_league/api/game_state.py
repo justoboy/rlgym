@@ -16,6 +16,7 @@ from .utils import create_default_init
 class GameState(Generic[AgentID]):
     tick_count: int  # The total number of ticks that have passed in the game
     goal_scored: bool
+    scoring_team: Optional[int]  # team id (BLUE_TEAM/ORANGE_TEAM) of the team that scored, or None
     config: GameConfig
     cars: Dict[AgentID, Car[AgentID]]
     ball: PhysicsObject
@@ -26,12 +27,6 @@ class GameState(Generic[AgentID]):
     __slots__ = tuple(__annotations__)
 
     exec(create_default_init(__slots__))
-
-    @property
-    def scoring_team(self) -> Optional[int]:
-        if self.goal_scored:
-            return 0 if self.ball.position[1] > 0 else 1
-        return None
 
     @property
     def inverted_ball(self) -> PhysicsObject:

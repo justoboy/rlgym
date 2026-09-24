@@ -20,6 +20,11 @@ class PhysicsObject:
     _rotation_mtx: Optional[np.ndarray]
     _euler_angles: Optional[np.ndarray]
 
+    # Heatseeker ball info (only meaningful for the ball in HEATSEEKER mode; None = inactive)
+    heatseeker_target_dir: Optional[float]
+    heatseeker_target_speed: Optional[float]
+    heatseeker_time_since_hit: Optional[float]
+
     __slots__ = tuple(__annotations__)
 
     exec(create_default_init(__slots__))
